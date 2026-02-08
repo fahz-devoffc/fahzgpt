@@ -3,112 +3,136 @@ import { GoogleGenAI, GenerateContentResponse } from "@google/genai";
 import { AIConfig, Attachment } from "../types";
 
 export class GeminiService {
-  private getClient(customEndpoint?: string) {
+  private getApiKey(): string {
     const apiKey = process.env.API_KEY;
-    
     if (!apiKey || apiKey === "undefined" || apiKey === "") {
-      throw new Error("API_KEY_NOT_FOUND: Masukkan API Key Anda di Environment Variables.");
+      throw new Error("API_KEY_NOT_FOUND: Masukkan API Key Anda di Environment Variables (misal di Vercel/Local ENV).");
     }
-    
-    // Inisialisasi client standar Google GenAI
-    // Jika menggunakan proxy seperti Vikey, baseUrl akan diarahkan ke sana.
-    // Catatan: SDK @google/genai akan mengirimkan API key melalui header 'x-goog-api-key'.
-    // Kebanyakan proxy Gemini (seperti Vikey) sudah mendukung header ini secara otomatis.
-    return new GoogleGenAI({ 
-      apiKey,
-      ...(customEndpoint ? { baseUrl: customEndpoint } : {})
-    });
+    return apiKey;
+  }
+
+  private isProxyConfig(config: AIConfig): boolean {
+    return !!(config.apiEndpoint && (config.apiEndpoint.includes('vikey.ai') || config.apiEndpoint.includes('/v1')));
   }
 
   async generateResponse(prompt: string, config: AIConfig, attachments?: Attachment[]): Promise<string> {
-    const ai = this.getClient(config.apiEndpoint);
-    try {
-      const parts: any[] = [{ text: prompt }];
-      
-      if (attachments && attachments.length > 0) {
-        attachments.forEach(att => {
-          parts.push({
-            inlineData: {
-              data: att.data,
-              mimeType: att.mimeType
-            }
-          });
+    const apiKey = this.getApiKey();
+    
+    if (this.isProxyConfig(config)) {
+      try {
+        const baseUrl = config.apiEndpoint?.replace(/\/+$/, '');
+        const response = await fetch(`${baseUrl}/chat/completions`, {
+          method: 'POST',
+          headers: {
+            "Authorization": `Bearer ${apiKey}`,
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({
+            model: config.model || "gemini-2.5-flash-lite-latest",
+            messages: [
+              { role: "system", content: config.systemInstruction },
+              { role: "user", content: prompt }
+            ],
+            temperature: config.temperature || 0.7,
+            max_tokens: 2048
+          })
         });
-      }
 
-      const response: GenerateContentResponse = await ai.models.generateContent({
-        model: config.model || 'gemini-flash-lite-latest',
-        contents: [{ role: 'user', parts }],
-        config: {
-          systemInstruction: config.systemInstruction,
-          temperature: config.temperature,
-        },
-      });
-
-      if (!response.text) {
-        throw new Error("Model merespons kosong. Periksa apakah saldo Vikey Anda mencukupi.");
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error?.message || `Proxy Error: ${response.status}`);
+        
+        return data.choices?.[0]?.message?.content || "Respon proxy kosong.";
+      } catch (error: any) {
+        throw new Error("Vikey Error: " + error.message);
       }
-
-      return response.text;
-    } catch (error: any) {
-      console.error("Gemini Error:", error);
-      
-      const msg = error.message || "";
-      if (msg.includes("API key not valid") || msg.includes("401")) {
-        throw new Error("API Key Vikey tidak valid atau salah format.");
-      }
-      if (msg.includes("404")) {
-        throw new Error(`Model '${config.model}' tidak ditemukan di endpoint ini.`);
-      }
-      
-      throw new Error(msg || "Terjadi masalah koneksi ke server Vikey/AI.");
     }
+
+    // Mode Standar SDK
+    const ai = new GoogleGenAI({ apiKey });
+    const parts: any[] = [{ text: prompt }];
+    if (attachments) {
+      attachments.forEach(att => parts.push({ inlineData: { data: att.data, mimeType: att.mimeType } }));
+    }
+
+    const res: GenerateContentResponse = await ai.models.generateContent({
+      model: config.model || 'gemini-flash-lite-latest',
+      contents: [{ role: 'user', parts }],
+      config: { systemInstruction: config.systemInstruction, temperature: config.temperature },
+    });
+    return res.text || "AI memberikan respon kosong.";
   }
 
-  async generateImage(prompt: string, config?: AIConfig): Promise<string> {
-    const ai = this.getClient(config?.apiEndpoint);
-    try {
-      const response = await ai.models.generateContent({
-        model: 'gemini-2.5-flash-image',
-        contents: [{ role: 'user', parts: [{ text: prompt }] }],
-      });
+  async generateImage(prompt: string, config: AIConfig): Promise<string> {
+    const apiKey = this.getApiKey();
 
-      const candidates = response.candidates;
-      if (candidates && candidates[0].content.parts) {
-        for (const part of candidates[0].content.parts) {
-          if (part.inlineData) {
-            return `data:${part.inlineData.mimeType};base64,${part.inlineData.data}`;
+    if (this.isProxyConfig(config)) {
+      try {
+        const baseUrl = config.apiEndpoint?.replace(/\/+$/, '');
+        // Banyak proxy menggunakan endpoint /images/generations (DALL-E style) 
+        // atau tetap via /chat/completions jika modelnya multimodal.
+        // Untuk Vikey, kita asumsikan menggunakan model flash-image via chat completion jika didukung,
+        // atau fallback ke standard fetch.
+        const response = await fetch(`${baseUrl}/chat/completions`, {
+          method: 'POST',
+          headers: {
+            "Authorization": `Bearer ${apiKey}`,
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({
+            model: "gemini-2.5-flash-image",
+            messages: [{ role: "user", content: prompt }],
+          })
+        });
+
+        const data = await response.json();
+        // Jika proxy mengembalikan content text berisi b64
+        if (data.choices?.[0]?.message?.content?.includes('data:image')) {
+          return data.choices[0].message.content;
+        }
+        // Jika proxy meneruskan format asli Gemini
+        if (data.candidates?.[0]?.content?.parts) {
+          for (const part of data.candidates[0].content.parts) {
+            if (part.inlineData) return `data:${part.inlineData.mimeType};base64,${part.inlineData.data}`;
           }
         }
+        throw new Error("Format gambar dari proxy tidak dikenal.");
+      } catch (error: any) {
+        // Jika gagal via proxy, beri tahu user
+        throw new Error("Gagal membuat gambar via Vikey: " + error.message);
       }
-      throw new Error("Gagal memproses gambar dari AI.");
-    } catch (error: any) {
-      throw new Error("Gagal membuat gambar: " + error.message);
     }
+
+    const ai = new GoogleGenAI({ apiKey });
+    const response = await ai.models.generateContent({
+      model: 'gemini-2.5-flash-image',
+      contents: [{ role: 'user', parts: [{ text: prompt }] }],
+    });
+
+    for (const part of response.candidates?.[0]?.content?.parts || []) {
+      if (part.inlineData) return `data:${part.inlineData.mimeType};base64,${part.inlineData.data}`;
+    }
+    throw new Error("Gagal memproses gambar.");
   }
 
-  async generateVideo(prompt: string, config?: AIConfig): Promise<string> {
-    const ai = this.getClient(config?.apiEndpoint);
-    try {
-      let operation = await ai.models.generateVideos({
-        model: 'veo-3.1-fast-generate-preview',
-        prompt: prompt,
-        config: { numberOfVideos: 1, resolution: '720p', aspectRatio: '16:9' }
-      });
+  async generateVideo(prompt: string, config: AIConfig): Promise<string> {
+    // Video generation biasanya membutuhkan API Key Google asli dan tidak disarankan via proxy
+    const apiKey = this.getApiKey();
+    const ai = new GoogleGenAI({ apiKey });
+    let operation = await ai.models.generateVideos({
+      model: 'veo-3.1-fast-generate-preview',
+      prompt: prompt,
+      config: { numberOfVideos: 1, resolution: '720p', aspectRatio: '16:9' }
+    });
 
-      while (!operation.done) {
-        await new Promise(resolve => setTimeout(resolve, 10000));
-        operation = await ai.operations.getVideosOperation({ operation: operation });
-      }
-
-      const downloadLink = operation.response?.generatedVideos?.[0]?.video?.uri;
-      const response = await fetch(`${downloadLink}&key=${process.env.API_KEY}`);
-      if (!response.ok) throw new Error("Gagal mengunduh file video.");
-      const blob = await response.blob();
-      return URL.createObjectURL(blob);
-    } catch (error: any) {
-      throw new Error("Generate Video gagal: " + error.message);
+    while (!operation.done) {
+      await new Promise(resolve => setTimeout(resolve, 10000));
+      operation = await ai.operations.getVideosOperation({ operation: operation });
     }
+
+    const downloadLink = operation.response?.generatedVideos?.[0]?.video?.uri;
+    const response = await fetch(`${downloadLink}&key=${apiKey}`);
+    const blob = await response.blob();
+    return URL.createObjectURL(blob);
   }
 }
 
